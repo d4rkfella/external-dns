@@ -382,6 +382,7 @@ func (r *rfc2136Provider) ApplyChanges(ctx context.Context, changes *plan.Change
 			}
 
 			zone := findMsgZone(ep, r.zoneNames)
+			r.krb5Realm = strings.ToUpper(strings.TrimSuffix(zone, "."))
 			m[zone].SetUpdate(zone)
 
 			r.AddRecord(m[zone], ep)
@@ -420,6 +421,7 @@ func (r *rfc2136Provider) ApplyChanges(ctx context.Context, changes *plan.Change
 			}
 
 			zone := findMsgZone(ep, r.zoneNames)
+			r.krb5Realm = strings.ToUpper(strings.TrimSuffix(zone, "."))
 			m[zone].SetUpdate(zone)
 
 			r.UpdateRecord(m[zone], changes.UpdateOld[i], ep)
@@ -457,6 +459,7 @@ func (r *rfc2136Provider) ApplyChanges(ctx context.Context, changes *plan.Change
 			}
 
 			zone := findMsgZone(ep, r.zoneNames)
+			r.krb5Realm = strings.ToUpper(strings.TrimSuffix(zone, "."))
 			m[zone].SetUpdate(zone)
 
 			r.RemoveRecord(m[zone], ep)
