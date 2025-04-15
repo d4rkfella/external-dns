@@ -5,7 +5,7 @@ contents:
     - https://packages.wolfi.dev/os
   packages:
     - wolfi-baselayout
-    - external-dns
+    - external-dns-custom
     - glibc-locale-posix
 accounts:
   groups:
