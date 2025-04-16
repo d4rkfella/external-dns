@@ -60,6 +60,7 @@ type rfc2136Provider struct {
 	batchChangeSize int
 	tlsConfig       TLSConfig
 	createPTR       bool
+	credMutex sync.Mutex
 
 	// options specific to rfc3645 gss-tsig support
 	gssTsig      bool
@@ -173,26 +174,46 @@ func NewRfc2136Provider(hosts []string, port int, zoneNames []string, insecure b
 }
 
 // KeyData will return TKEY name and TSIG handle to use for followon actions with a secure connection
-func (r *rfc2136Provider) KeyData(nameserver string) (keyName string, handle *gss.Client, err error) {
-	// Check if we already have credentials for this nameserver
-	if existingHandle, ok := r.credentials[nameserver]; ok {
-		return nameserver, existingHandle, nil
-	}
+func (r *rfc2136Provider) KeyData(nameserver string) (string, *gss.Client, error) {
+    r.credMutex.Lock()
+    defer r.credMutex.Unlock()
 
-	handle, err = gss.NewClient(new(dns.Client))
-	if err != nil {
-		return keyName, handle, err
-	}
+    // Try cached credentials first
+    if handle, exists := r.credentials[nameserver]; exists {
+        // Verify context is still valid
+        if _, err := handle.NegotiateContext(); err == nil {
+            log.Debugf("Using cached credentials for %s", nameserver)
+            return nameserver, handle, nil
+        }
+        
+        // Purge invalid credentials
+        log.Warnf("Cached credentials expired for %s, reauthenticating...", nameserver)
+        handle.Close()
+        delete(r.credentials, nameserver)
+    }
 
-	keyName, _, err = handle.NegotiateContextWithCredentials(nameserver, r.krb5Realm, r.krb5Username, r.krb5Password)
-	if err != nil {
-		return keyName, handle, err
-	}
+    // Full reauthentication
+    log.Infof("Negotiating new GSS-TSIG context for %s", nameserver)
+    handle, err := gss.NewClient(new(dns.Client))
+    if err != nil {
+        return "", nil, fmt.Errorf("GSS client creation failed: %w", err)
+    }
 
-	// Store the credentials for this nameserver
-	r.credentials[nameserver] = handle
+    keyName, _, err := handle.NegotiateContextWithCredentials(
+        nameserver,
+        r.krb5Realm,
+        r.krb5Username,
+        r.krb5Password,
+    )
+    if err != nil {
+        return "", nil, fmt.Errorf("GSS negotiation failed: %w", err)
+    }
 
-	return keyName, handle, nil
+    // Update cache with fresh credentials
+    r.credentials[nameserver] = handle
+    log.Infof("New credentials cached for %s (realm: %s)", nameserver, r.krb5Realm)
+    
+    return keyName, handle, nil
 }
 
 // Records returns the list of records.
@@ -577,70 +598,85 @@ func (r *rfc2136Provider) getNextNameserver() string {
 }
 
 func (r *rfc2136Provider) SendMessage(msg *dns.Msg) error {
-	if r.dryRun {
-		log.Debugf("SendMessage.skipped")
-		return nil
-	}
-	log.Debugf("SendMessage")
+    if r.dryRun {
+        log.Debugf("SendMessage.skipped")
+        return nil
+    }
+    log.Debugf("SendMessage")
 
-	var lastErr error
-	for i := 0; i < len(r.nameservers); i++ {
-		nameserver := r.getNextNameserver()
-		log.Debugf("Sending message to nameserver: %s", nameserver)
+    var lastErr error
+    for i := 0; i < len(r.nameservers); i++ {
+        nameserver := r.getNextNameserver()
+        log.Debugf("Sending message to nameserver: %s", nameserver)
 
-		c, err := makeClient(r, nameserver)
-		if err != nil {
-			lastErr = fmt.Errorf("error setting up TLS: %w", err)
-			r.lastErr = lastErr
-			continue
-		}
+        c, err := makeClient(r, nameserver)
+        if err != nil {
+            lastErr = fmt.Errorf("error setting up TLS: %w", err)
+            r.lastErr = lastErr
+            log.Errorf("Connection setup failed for %s: %v", nameserver, err)
+            continue
+        }
 
-		if !r.insecure {
-			if r.gssTsig {
-				keyName, handle, err := r.KeyData(nameserver)
-				if err != nil {
-					lastErr = err
-					r.lastErr = lastErr
-					continue
-				}
-				defer handle.Close()
-				defer handle.DeleteContext(keyName)
+        // Handle TSIG authentication
+        if !r.insecure {
+            if r.gssTsig {
+                // Get cached or new GSS-TSIG credentials
+                keyName, handle, err := r.KeyData(nameserver)
+                if err != nil {
+                    log.Errorf("GSS-TSIG authentication failed for %s: %v", nameserver, err)
+                    lastErr = fmt.Errorf("gss-tsig auth failed: %w", err)
+                    r.lastErr = lastErr
+                    continue
+                }
 
-				c.TsigProvider = handle
+                // Configure TSIG without closing the handle
+                c.TsigProvider = handle
+                msg.SetTsig(keyName, tsig.GSS, clockSkew, time.Now().Unix())
+                log.Debugf("Using GSS-TSIG key %s for %s", keyName, nameserver)
+            } else {
+                // HMAC-TSIG configuration
+                if r.tsigKeyName == "" || r.tsigSecret == "" {
+                    log.Error("HMAC-TSIG credentials not configured")
+                    return errors.New("tsig credentials missing")
+                }
+                c.TsigProvider = tsig.HMAC{r.tsigKeyName: r.tsigSecret}
+                msg.SetTsig(r.tsigKeyName, r.tsigSecretAlg, clockSkew, time.Now().Unix())
+                log.Debugf("Using HMAC-TSIG key %s with algorithm %s", 
+                    r.tsigKeyName, r.tsigSecretAlg)
+            }
+        }
 
-				msg.SetTsig(keyName, tsig.GSS, clockSkew, time.Now().Unix())
-			} else {
-				c.TsigProvider = tsig.HMAC{r.tsigKeyName: r.tsigSecret}
-				msg.SetTsig(r.tsigKeyName, r.tsigSecretAlg, clockSkew, time.Now().Unix())
-			}
-		}
+        // Send DNS message
+        resp, _, err := c.Exchange(msg, nameserver)
+        if err != nil {
+            if resp != nil && resp.Rcode != dns.RcodeSuccess {
+                log.Errorf("DNS exchange error for %s: %v (Rcode: %s)", 
+                    nameserver, err, dns.RcodeToString[resp.Rcode])
+                lastErr = fmt.Errorf("dns error: %w (rcode: %s)", 
+                    err, dns.RcodeToString[resp.Rcode])
+            } else {
+                log.Warnf("DNS connection error for %s: %v", nameserver, err)
+                lastErr = fmt.Errorf("connection error: %w", err)
+            }
+            r.lastErr = lastErr
+            continue
+        }
 
-		resp, _, err := c.Exchange(msg, nameserver)
-		if err != nil {
-			if resp != nil && resp.Rcode != dns.RcodeSuccess {
-				log.Infof("error in dns.Client.Exchange: %s", err)
-				lastErr = err
-				r.lastErr = lastErr
-				continue
-			}
-			log.Warnf("warn in dns.Client.Exchange: %s", err)
-			lastErr = err
-			r.lastErr = lastErr
-			continue
-		}
-		if resp != nil && resp.Rcode != dns.RcodeSuccess {
-			log.Infof("Bad dns.Client.Exchange response: %s", resp)
-			lastErr = fmt.Errorf("bad return code: %s", dns.RcodeToString[resp.Rcode])
-			r.lastErr = lastErr
-			continue
-		}
+        if resp != nil && resp.Rcode != dns.RcodeSuccess {
+            log.Errorf("Bad DNS response from %s: %s", 
+                nameserver, dns.RcodeToString[resp.Rcode])
+            lastErr = fmt.Errorf("bad response code: %s", 
+                dns.RcodeToString[resp.Rcode])
+            r.lastErr = lastErr
+            continue
+        }
 
-		log.Debugf("SendMessage.success")
-		return nil
-	}
+        log.Debugf("SendMessage.success to %s", nameserver)
+        return nil
+    }
 
-	r.lastErr = lastErr
-	return lastErr
+    r.lastErr = lastErr
+    return fmt.Errorf("all nameservers failed: %w", lastErr)
 }
 
 func chunkBy(slice []*endpoint.Endpoint, chunkSize int) [][]*endpoint.Endpoint {
